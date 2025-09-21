@@ -65,16 +65,35 @@
 //! VOC index calculation is not no-std proof right now so if this is a problem for you, then
 //! you want to turn the feature off by turning "the defaults off". Work for no-std index calculation
 //! will start soon.
-#![cfg_attr(not(test), no_std)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
+#![no_std]
 
-use embedded_hal as hal;
+#[cfg(not(any(feature = "async", feature = "sync")))]
+compile_error!("Either `async` or `sync` feature must be enabled");
 
-use hal::delay::DelayNs;
-use hal::i2c::I2c;
+#[cfg(all(feature = "sync", feature = "async"))]
+compile_error!("Features `sync` and `async` cannot be enabled at the same time.");
 
-use sensirion_i2c::{crc8, i2c};
+use embedded_hal::i2c::ErrorType;
+#[cfg(feature = "async")]
+use embedded_hal_async::delay::DelayNs as AsyncDelayNs;
+
+#[cfg(feature = "async")]
+use embedded_hal_async::i2c::I2c;
+
+#[cfg(feature = "async")]
+use sensirion_i2c::i2c_async as i2c;
+
+#[cfg(feature = "sync")]
+use sensirion_i2c::i2c;
+
+use sensirion_i2c::{crc8, i2c::Error as I2cError};
+
+#[cfg(feature = "sync")]
+use embedded_hal::delay::DelayNs;
+#[cfg(feature = "sync")]
+use embedded_hal::i2c::I2c;
 
 #[cfg(feature = "voc_index")]
 mod vocalg;
@@ -93,11 +112,11 @@ pub enum Error<E> {
     SelfTest,
 }
 
-impl<E, I> From<i2c::Error<I>> for Error<E>
+impl<E, I> From<I2cError<I>> for Error<E>
 where
-    I: I2c<Error = E>,
+    I: ErrorType<Error = E>,
 {
-    fn from(err: i2c::Error<I>) -> Self {
+    fn from(err: I2cError<I>) -> Self {
         match err {
             i2c::Error::Crc => Error::Crc,
             i2c::Error::I2cWrite(e) => Error::I2c(e),
@@ -142,7 +161,8 @@ impl Command {
 /// rock'n'roll. This driver doesn't require special starting but once can start to
 /// make measurements right away. However, the initial values after start-up will
 /// unstable so you will want to throw away some of them.
-pub struct Sgp40<I2C, D> {
+#[maybe_async_cfg::maybe(sync(feature = "sync", self = "Sgp40"), async(feature = "async", keep_self))]
+pub struct AsyncSgp40<I2C, D> {
     i2c: I2C,
     address: u8,
     delay: D,
@@ -151,14 +171,18 @@ pub struct Sgp40<I2C, D> {
     voc: VocAlgorithm,
 }
 
-impl<I2C, D, E> Sgp40<I2C, D>
+#[maybe_async_cfg::maybe(
+    sync(feature = "sync", self = "Sgp40", idents(AsyncDelayNs(sync = "DelayNs"))),
+    async(feature = "async", keep_self)
+)]
+impl<I2C, D> AsyncSgp40<I2C, D>
 where
-    I2C: hal::i2c::I2c<Error = E>,
-    D: DelayNs,
+    I2C: I2c + ErrorType,
+    D: AsyncDelayNs,
 {
     /// Creates Sgp40 driver
     pub fn new(i2c: I2C, address: u8, delay: D) -> Self {
-        Sgp40 {
+        AsyncSgp40 {
             i2c,
             address,
             delay,
@@ -169,14 +193,14 @@ where
     }
 
     /// Command for reading values from the sensor
-    fn delayed_read_cmd(&mut self, cmd: Command, data: &mut [u8]) -> Result<(), Error<E>> {
-        self.write_command(cmd)?;
-        i2c::read_words_with_crc(&mut self.i2c, self.address, data)?;
+    async fn delayed_read_cmd(&mut self, cmd: Command, data: &mut [u8]) -> Result<(), Error<I2C::Error>> {
+        self.write_command(cmd).await?;
+        i2c::read_words_with_crc(&mut self.i2c, self.address, data).await?;
         Ok(())
     }
 
     /// Writes commands with arguments
-    fn write_command_with_args(&mut self, cmd: Command, data: &[u8]) -> Result<(), Error<E>> {
+    async fn write_command_with_args(&mut self, cmd: Command, data: &[u8]) -> Result<(), Error<I2C::Error>> {
         const MAX_TX_BUFFER: usize = 14; //cmd (2 bytes) + max args (12 bytes)
 
         let mut transfer_buffer = [0; MAX_TX_BUFFER];
@@ -199,6 +223,7 @@ where
 
         self.i2c
             .write(self.address, &transfer_buffer[0..i])
+            .await
             .map_err(Error::I2c)?;
         self.delay.delay_ms(delay);
 
@@ -206,9 +231,11 @@ where
     }
 
     /// Writes commands without additional arguments.
-    fn write_command(&mut self, cmd: Command) -> Result<(), Error<E>> {
+    async fn write_command(&mut self, cmd: Command) -> Result<(), Error<I2C::Error>> {
         let (command, delay) = cmd.as_tuple();
-        i2c::write_command_u16(&mut self.i2c, self.address, command).map_err(Error::I2c)?;
+        i2c::write_command_u16(&mut self.i2c, self.address, command)
+            .await
+            .map_err(Error::I2c)?;
         self.delay.delay_ms(delay);
         Ok(())
     }
@@ -217,11 +244,11 @@ where
     ///
     /// Performs sensor self-test. This is intended for production line and testing and verification only and
     /// shouldn't be needed for normal use.
-    pub fn self_test(&mut self) -> Result<&mut Self, Error<E>> {
+    pub async fn self_test(&mut self) -> Result<&mut Self, Error<I2C::Error>> {
         const MEASURE_TEST_OK: u16 = 0xd400;
         let mut data = [0; 3];
 
-        self.delayed_read_cmd(Command::MeasureTest, &mut data)?;
+        self.delayed_read_cmd(Command::MeasureTest, &mut data).await?;
 
         let result = u16::from_be_bytes([data[0], data[1]]);
 
@@ -236,8 +263,8 @@ where
     ///
     /// Stops running the measurements, places heater into idle by turning the heaters off.
     #[inline]
-    pub fn turn_heater_off(&mut self) -> Result<&Self, Error<E>> {
-        self.write_command(Command::HeaterOff)?;
+    pub async fn turn_heater_off(&mut self) -> Result<&Self, Error<I2C::Error>> {
+        self.write_command(Command::HeaterOff).await?;
         Ok(self)
     }
 
@@ -245,8 +272,8 @@ where
     ///
     /// Executes a reset on the device. The caller must wait 100ms before starting to use the device again.
     #[inline]
-    pub fn reset(&mut self) -> Result<&Self, Error<E>> {
-        self.write_command(Command::SoftReset)?;
+    pub async fn reset(&mut self) -> Result<&Self, Error<I2C::Error>> {
+        self.write_command(Command::SoftReset).await?;
         Ok(self)
     }
 
@@ -257,8 +284,8 @@ where
     /// algoritm working.
     #[cfg(feature = "voc_index")]
     #[inline]
-    pub fn measure_voc_index(&mut self) -> Result<u16, Error<E>> {
-        let raw = self.measure_raw_with_rht(50000, 25000)?;
+    pub async fn measure_voc_index(&mut self) -> Result<u16, Error<I2C::Error>> {
+        let raw = self.measure_raw_with_rht(50000, 25000).await?;
 
         Ok(self.voc.process(raw as i32) as u16)
     }
@@ -273,8 +300,12 @@ where
     /// algoritm working.
     #[cfg(feature = "voc_index")]
     #[inline]
-    pub fn measure_voc_index_with_rht(&mut self, humidity: u16, temperature: i16) -> Result<u16, Error<E>> {
-        let raw = self.measure_raw_with_rht(humidity, temperature)?;
+    pub async fn measure_voc_index_with_rht(
+        &mut self,
+        humidity: u16,
+        temperature: i16,
+    ) -> Result<u16, Error<I2C::Error>> {
+        let raw = self.measure_raw_with_rht(humidity, temperature).await?;
 
         Ok(self.voc.process(raw as i32) as u16)
     }
@@ -284,15 +315,15 @@ where
     /// Raw signal without temperature and humidity compensation. This is not
     /// VOC index but needs to be processed through different algorithm for that.
     #[inline]
-    pub fn measure_raw(&mut self) -> Result<u16, Error<E>> {
-        self.measure_raw_with_rht(50000, 25000)
+    pub async fn measure_raw(&mut self) -> Result<u16, Error<I2C::Error>> {
+        self.measure_raw_with_rht(50000, 25000).await
     }
 
     /// Reads the raw signal from the sensor.
     ///
     /// Raw signal with temperature and humidity compensation. This is not
     /// VOC index but needs to be processed through different algorithm for that.
-    pub fn measure_raw_with_rht(&mut self, humidity: u16, temperature: i16) -> Result<u16, Error<E>> {
+    pub async fn measure_raw_with_rht(&mut self, humidity: u16, temperature: i16) -> Result<u16, Error<I2C::Error>> {
         let mut data = [0; 3];
 
         let (hum_ticks, temp_ticks) = self.convert_rht(humidity as u32, temperature as i32);
@@ -301,8 +332,8 @@ where
         params[0..2].copy_from_slice(&hum_ticks.to_be_bytes());
         params[2..4].copy_from_slice(&temp_ticks.to_be_bytes());
 
-        self.write_command_with_args(Command::MeasurementRaw, &params)?;
-        i2c::read_words_with_crc(&mut self.i2c, self.address, &mut data)?;
+        self.write_command_with_args(Command::MeasurementRaw, &params).await?;
+        i2c::read_words_with_crc(&mut self.i2c, self.address, &mut data).await?;
 
         Ok(u16::from_be_bytes([data[0], data[1]]))
     }
@@ -337,7 +368,7 @@ where
     /// This command sets the temperature offset used for the compensation of subsequent RHT measurements.RawSignals
     /// The parameter provides the temperature offset (in °C) with a scaling factor of 200, e.g., an output of +400 corresponds to +2.00 °C.
     #[inline]
-    pub fn set_temperature_offset(&mut self, offset: i16) -> Result<&mut Self, Error<E>> {
+    pub fn set_temperature_offset(&mut self, offset: i16) -> Result<&mut Self, Error<I2C::Error>> {
         self.temperature_offset += offset;
         Ok(self)
     }
@@ -345,17 +376,17 @@ where
     /// Gets the temperature offset
     ///
     /// Gets the temperature compensation offset issues to the device.
-    pub fn get_temperature_offset(&mut self) -> Result<i16, Error<E>> {
+    pub fn get_temperature_offset(&mut self) -> Result<i16, Error<I2C::Error>> {
         Ok(self.temperature_offset)
     }
 
     /// Acquires the sensor serial number.
     ///
     /// Sensor serial number is only 48-bits long so the remaining 16-bits are zeros.
-    pub fn serial(&mut self) -> Result<u64, Error<E>> {
+    pub async fn serial(&mut self) -> Result<u64, Error<I2C::Error>> {
         let mut serial = [0; 9];
 
-        self.delayed_read_cmd(Command::Serial, &mut serial)?;
+        self.delayed_read_cmd(Command::Serial, &mut serial).await?;
 
         let serial = (u64::from(serial[0]) << 40)
             | (u64::from(serial[1]) << 32)

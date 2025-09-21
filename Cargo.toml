@@ -15,11 +15,15 @@ edition = "2024"
 [features]
 default = ["voc_index"]
 voc_index = []
+sync = []
+async = ["embedded-hal-async", "sensirion-i2c/embedded-hal-async"]
 
 [dependencies]
 sensirion-i2c = "0.4"
 embedded-hal = { version = "1.0" }
 fixed = "1"
+embedded-hal-async = {version =  "1.0.0", optional = true }
+maybe-async-cfg = "0.2.5"
 
 [dev-dependencies]
 linux-embedded-hal = "0.4"
