@@ -225,7 +225,7 @@ where
             .write(self.address, &transfer_buffer[0..i])
             .await
             .map_err(Error::I2c)?;
-        self.delay.delay_ms(delay);
+        self.delay.delay_ms(delay).await;
 
         Ok(())
     }
@@ -236,7 +236,7 @@ where
         i2c::write_command_u16(&mut self.i2c, self.address, command)
             .await
             .map_err(Error::I2c)?;
-        self.delay.delay_ms(delay);
+        self.delay.delay_ms(delay).await;
         Ok(())
     }
 
